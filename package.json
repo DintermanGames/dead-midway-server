@@ -1,0 +1,13 @@
+{
+  "name": "zombie-survivors-coop-server",
+  "version": "0.7.1",
+  "private": true,
+  "type": "module",
+  "description": "Static host + WebSocket room relay for Dead Midway online co-op (no dependencies).",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
