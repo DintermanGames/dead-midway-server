@@ -1,4 +1,6 @@
-// Dead Midway co-op server: static file host for dist/ + a tiny WebSocket room relay.
+// Dead Midway server: static file host for dist/ + a tiny WebSocket room relay + (v0.8.0) the game API in api.mjs:
+// guest accounts + cloud saves, daily/weekly event leaderboards, co-op quick match, privacy-friendly analytics.
+// Optional env (v0.8.0): DATABASE_URL (Postgres; else memory), DATA_DIR (file snapshot for the memory store), ADMIN_KEY (analytics summary).
 // Zero dependencies (Node 18+). Run:  node server/server.mjs   (PORT env, default 8787)
 // v0.7.0 deploy settings (all optional env vars, see SERVER_SETUP.md / render.yaml):
 //   PORT             listen port (Render sets this)            STATIC_DIR   folder to serve, or "none" for relay-only
@@ -11,6 +13,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { openStore } from './store.mjs';
+import { createApi } from './api.mjs';
 
 const PORT = +(process.env.PORT || 8787);
 const ROOT = path.resolve(process.env.STATIC_DIR || path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'dist'));
@@ -18,7 +22,9 @@ const MAX_PLAYERS = 4, MAX_MSG = 512 * 1024, MAX_BUFFER = 1.5 * 1024 * 1024;
 const STATIC_OFF = String(process.env.STATIC_DIR || '').toLowerCase() === 'none' || !fs.existsSync(ROOT);
 const ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 const MAX_CLIENTS = +(process.env.MAX_CLIENTS || 400), MAX_ROOMS = +(process.env.MAX_ROOMS || 150), MSG_PER_SEC = 120;
-const VERSION = '0.7.1', started = Date.now();
+const VERSION = '0.8.0', started = Date.now();
+const store = await openStore();
+const api = createApi({ store, version: VERSION, originOk, ORIGINS, adminKey: process.env.ADMIN_KEY || '', log: s => log(s) });
 function originOk(o) { return !ORIGINS.length || (o && ORIGINS.includes(String(o).replace(/\/$/, ''))); }
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.webp': 'image/webp', '.mp3': 'audio/mpeg', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
 
@@ -26,8 +32,9 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '
 const server = http.createServer((req, res) => {
   const url = decodeURIComponent((req.url || '/').split('?')[0]);
   const cors = { 'Access-Control-Allow-Origin': ORIGINS.length ? (originOk(req.headers.origin) ? req.headers.origin : 'null') : '*', 'Vary': 'Origin' };
-  if (url === '/healthz') { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors }); return res.end(JSON.stringify({ ok: true, version: VERSION, rooms: rooms.size, clients: clients.size, uptime: Math.round((Date.now() - started) / 1000) })); }
-  if (req.method === 'OPTIONS') { res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, OPTIONS' }); return res.end(); }
+  if (url === '/healthz') { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors }); return res.end(JSON.stringify({ ok: true, version: VERSION, rooms: rooms.size, clients: clients.size, queue: quickQ.length, store: store.kind + (store.degraded ? ' (' + store.degraded + ')' : ''), uptime: Math.round((Date.now() - started) / 1000) })); }
+  if (req.method === 'OPTIONS') { res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '600' }); return res.end(); }
+  if (url.startsWith('/api/')) return api(req, res, url, cors); // v0.8.0: accounts, cloud save, events/leaderboards, analytics
   if (STATIC_OFF) { res.writeHead(url === '/' ? 200 : 404, { 'Content-Type': 'text/plain', ...cors }); return res.end(url === '/' ? 'Dead Midway co-op server ' + VERSION + ' is running. WebSocket endpoint: /ws' : 'not found'); }
   let p = path.join(ROOT, url);
   if (!p.startsWith(ROOT)) { res.writeHead(403); return res.end(); }
@@ -101,7 +108,7 @@ function clean(n) { return String(n || 'Survivor').replace(/[<>]/g, '').trim().s
 function handle(c, m) {
   if (m.t === 'create') {
     if (rooms.size >= MAX_ROOMS) return send(c, { t: 'error', msg: 'Servers are busy right now. Please try again in a minute.' });
-    leave(c); c.name = clean(m.name);
+    unqueue(c); leave(c); c.name = clean(m.name);
     const r = { code: code(), host: c, players: [c], locked: false, created: Date.now() }; rooms.set(r.code, r); c.room = r;
     send(c, { t: 'joined', code: r.code, id: c.id, host: true, players: roster(r) });
     log(`room ${r.code} created by ${c.name}`);
@@ -110,7 +117,7 @@ function handle(c, m) {
     if (!r) return send(c, { t: 'error', msg: 'Room not found. Check the code.' });
     if (r.locked) return send(c, { t: 'error', msg: 'That game has already started.' });
     if (r.players.length >= MAX_PLAYERS) return send(c, { t: 'error', msg: 'Room is full (4 players).' });
-    leave(c); c.name = clean(m.name); r.players.push(c); c.room = r;
+    unqueue(c); leave(c); c.name = clean(m.name); r.players.push(c); c.room = r;
     send(c, { t: 'joined', code: r.code, id: c.id, host: false, players: roster(r) });
     broadcastRoster(r); log(`${c.name} joined ${r.code} (${r.players.length})`);
   } else if (m.t === 'lock') {
@@ -123,7 +130,25 @@ function handle(c, m) {
       if (m.to === '*' || !m.to) r.players.forEach(p => { if (p !== c) send(p, out, snap); });
       else { const p = r.players.find(q => q.id === m.to); if (p) send(p, out, snap); }
     } else send(r.host, { t: 'msg', from: c.id, d: m.d });
-  } else if (m.t === 'leave') leave(c);
+  } else if (m.t === 'leave') { unqueue(c); leave(c); }
+  else if (m.t === 'quick') quick(c, m);           // v0.8.0 co-op quick match (older clients never send this)
+  else if (m.t === 'unquick') { unqueue(c); send(c, { t: 'unqueued' }); }
+}
+// ---------- v0.8.0 quick match: a FIFO queue; the first two waiting players are put in a fresh room (oldest = host) ----------
+const quickQ = [];
+function unqueue(c) { const i = quickQ.indexOf(c); if (i >= 0) quickQ.splice(i, 1); c.quick = false; }
+function quick(c, m) {
+  unqueue(c); leave(c); c.name = clean(m.name); c.quick = true; c.qAt = Date.now(); c.qUnl = Math.max(1, Math.min(99, +m.unl || 1));
+  quickQ.push(c);
+  if (quickQ.length >= 2) {
+    if (rooms.size >= MAX_ROOMS) { unqueue(c); return send(c, { t: 'error', msg: 'Servers are busy right now. Please try again in a minute.' }); }
+    const a = quickQ.shift(), b = quickQ.shift(); a.quick = b.quick = false;
+    const r = { code: code(), host: a, players: [a, b], locked: false, created: Date.now(), quick: true }; rooms.set(r.code, r); a.room = b.room = r;
+    const unl = Math.min(a.qUnl, b.qUnl);
+    send(a, { t: 'joined', code: r.code, id: a.id, host: true, quick: true, unl, players: roster(r) });
+    send(b, { t: 'joined', code: r.code, id: b.id, host: false, quick: true, unl, players: roster(r) });
+    broadcastRoster(r); log(`quick match ${r.code}: ${a.name} + ${b.name}`);
+  } else quickQ.forEach((q, i) => send(q, { t: 'queued', pos: i + 1, n: quickQ.length }));
 }
 function leave(c) {
   const r = c.room; if (!r) return; c.room = null;
@@ -132,14 +157,17 @@ function leave(c) {
   r.players.forEach(p => send(p, { t: 'left', id: c.id }));
   broadcastRoster(r);
 }
-function drop(c) { if (!clients.has(c)) return; clients.delete(c); leave(c); try { c.sock.destroy(); } catch (e) {} }
+function drop(c) { if (!clients.has(c)) return; clients.delete(c); unqueue(c); leave(c); try { c.sock.destroy(); } catch (e) {} }
 function log(s) { console.log(new Date().toISOString(), s); }
 // heartbeat: drop dead sockets, expire empty/stale rooms
 setInterval(() => {
   clients.forEach(c => { if (!c.alive) return drop(c); c.alive = false; frame(c, Buffer.alloc(0), 0x9); });
   rooms.forEach((r, k) => { if (!r.players.length || Date.now() - r.created > 6 * 3600e3) rooms.delete(k); });
+  for (let i = quickQ.length - 1; i >= 0; i--) if (Date.now() - quickQ[i].qAt > 10 * 60e3 || quickQ[i].sock.destroyed) { send(quickQ[i], { t: 'unqueued', timeout: true }); unqueue(quickQ[i]); }
 }, 25000);
+setInterval(() => { store.prune().catch(e => log('prune failed ' + e.message)); }, 6 * 3600e3).unref();
+store.prune().catch(() => {});
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Dead Midway co-op server ${VERSION} on port ${PORT}  (static: ${STATIC_OFF ? 'off' : ROOT}, origins: ${ORIGINS.join(' ') || 'any'}, websocket: /ws)`));
-function shutdown() { log('shutting down'); clients.forEach(c => { try { c.sock.end(); } catch (e) {} }); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); }
+server.listen(PORT, '0.0.0.0', () => console.log(`Dead Midway server ${VERSION} on port ${PORT}  (store: ${store.kind}, static: ${STATIC_OFF ? 'off' : ROOT}, origins: ${ORIGINS.join(' ') || 'any'}, websocket: /ws)`));
+function shutdown() { log('shutting down'); clients.forEach(c => { try { c.sock.end(); } catch (e) {} }); store.close().catch(() => {}); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); }
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
